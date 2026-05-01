@@ -1,0 +1,44 @@
+name: "JBD BMS MQTT"
+description: "Citeste datele de la BMS JBD via RS485 si le publica pe MQTT cu HA auto-discovery."
+version: "1.3.0"
+slug: "jbd_bms_mqtt"
+init: false
+arch:
+  - amd64
+  - aarch64
+  - armv7
+map:
+  - config:rw
+uart: true
+devices:
+  - /dev/ttyUSB0
+  - /dev/ttyUSB1
+  - /dev/ttyUSB2
+options:
+  serial_port: "/dev/ttyUSB0"
+  serial_port_by_id: ""
+  baud_rate: 19200
+  poll_interval: 30
+  num_cells: 9
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_user: "mqtt_local"
+  mqtt_password: "mqtt2026vidra"
+  mqtt_prefix: "jbd_bms"
+  device_name: "Acumulator JBD"
+  device_id: "jbd_bms_vidra"
+  log_level: "INFO"
+schema:
+  serial_port: str
+  serial_port_by_id: str
+  baud_rate: int(1200,115200)
+  poll_interval: int(5,300)
+  num_cells: int(1,24)
+  mqtt_host: str
+  mqtt_port: int(1,65535)
+  mqtt_user: str
+  mqtt_password: str
+  mqtt_prefix: str
+  device_name: str
+  device_id: str
+  log_level: list(DEBUG|INFO|WARNING|ERROR)
