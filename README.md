@@ -10,70 +10,74 @@ Addon Home Assistant pentru citirea datelor de la un BMS JBD via RS485 și publi
 |------------|-------|
 | BMS | JBD SP15S001 (protocol 0x78 broadcast) |
 | Acumulator | 9S3P LiFePO4 |
-| Adaptor serial | FTDI FT232R USB-UART (recomandat) |
-| Alternativ | CH340 USB-Serial (fără serial number unic — nu suportă `by-id`) |
+| Interfață BMS | Port RJ45 (etichetat „RS232" pe carcasă) |
+| Pinii utilizați | Pin 7 = RS485 A (Data+), Pin 8 = RS485 B (Data-) |
+| Adaptor serial | RS485-USB cu FTDI FT232R (recomandat — serial number unic) |
+| Alternativ | RS485-USB cu CH340 (fără serial number unic — nu suportă `by-id`) |
 
 ---
 
 ## Schema de conectare BMS → HA
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    BMS JBD SP15S001                      │
-│                                                         │
-│   Port RS485 / UART                                     │
-│   ┌──────┐                                              │
-│   │ TX   │──────────────────────────────┐               │
-│   │ RX   │──────────────────────────┐   │               │
-│   │ GND  │───────────────────────┐  │   │               │
-│   └──────┘                       │  │   │               │
-└─────────────────────────────────│──│───│───────────────┘
-                                  │  │   │
-                                  │  │   │
-┌─────────────────────────────────│──│───│───────────────┐
-│   Adaptor USB-Serial (FTDI)     │  │   │               │
-│   ┌──────┐                      │  │   │               │
-│   │ GND  │──────────────────────┘  │   │               │
-│   │ RX   │─────────────────────────┘   │               │
-│   │ TX   │──────────────────────────────┘               │
-│   │ USB  │                                              │
-│   └──────┘                                              │
+┌──────────────────────────────────────────────────────────┐
+│                   BMS JBD SP15S001                       │
+│                                                          │
+│   Port RJ45 (etichetat "RS232" pe carcasă)              │
+│   ┌─────────────────────────┐                            │
+│   │ Pin 1..6  (neutilizați) │                            │
+│   │ Pin 7  RS485 A (Data+)  │────────────────┐           │
+│   │ Pin 8  RS485 B (Data-)  │──────────────┐ │           │
+│   └─────────────────────────┘              │ │           │
+└────────────────────────────────────────────│─│───────────┘
+                                             │ │
+                                             │ │
+┌────────────────────────────────────────────│─│───────────┐
+│   Adaptor RS485-USB (FTDI FT232R)          │ │           │
+│   ┌──────────────┐                         │ │           │
+│   │ B  (Data-)   │─────────────────────────┘ │           │
+│   │ A  (Data+)   │───────────────────────────┘           │
+│   │ GND          │──── GND comun (dacă necesar)          │
+│   │ USB          │                                        │
+│   └──────────────┘                                        │
+└───────────────────────────────────────────────────────────┘
+          │
+          │ USB
+          ▼
+┌──────────────────────────────────────────────────────────┐
+│   Home Assistant OS (Dell Wyse 5070)                     │
+│   /dev/serial/by-id/                                     │
+│   usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0           │
+│                                                          │
+│   ┌─────────────────────────────────────────────┐        │
+│   │  Addon: JBD BMS MQTT                        │        │
+│   │  Protocol: 0x78 broadcast, 19200bps 8N1     │        │
+│   │  Poll: 30s                                  │        │
+│   └─────────────────────┬───────────────────────┘        │
+│                         │ MQTT                           │
+│   ┌─────────────────────▼───────────────────────┐        │
+│   │  Broker: core-mosquitto                      │        │
+│   │  Topic: jbd_bms/state                       │        │
+│   └─────────────────────┬───────────────────────┘        │
+│                         │                                │
+│   ┌─────────────────────▼───────────────────────┐        │
+│   │  Home Assistant                              │        │
+│   │  Auto-discovery → Entități HA               │        │
+│   └─────────────────────────────────────────────┘        │
 └──────────────────────────────────────────────────────────┘
-         │
-         │ USB
-         ▼
-┌─────────────────────────────────────────────────────────┐
-│   Home Assistant OS (Dell Wyse 5070)                    │
-│   /dev/serial/by-id/                                    │
-│   usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0          │
-│                                                         │
-│   ┌──────────────────────────────────────────────┐      │
-│   │  Addon: JBD BMS MQTT                         │      │
-│   │  Protocol: 0x78 broadcast, 19200bps 8N1      │      │
-│   │  Poll: 30s                                   │      │
-│   └──────────────────┬───────────────────────────┘      │
-│                      │ MQTT                             │
-│   ┌──────────────────▼───────────────────────────┐      │
-│   │  Broker: core-mosquitto                       │      │
-│   │  Topic: jbd_bms/state                        │      │
-│   └──────────────────┬───────────────────────────┘      │
-│                      │                                  │
-│   ┌──────────────────▼───────────────────────────┐      │
-│   │  Home Assistant                               │      │
-│   │  Auto-discovery → Entități HA                │      │
-│   └──────────────────────────────────────────────┘      │
-└─────────────────────────────────────────────────────────┘
 ```
 
-### Pinout BMS JBD (port comunicație)
+### Pinout RJ45 BMS JBD
 
-| Pin BMS | Semnal | Conectare |
-|---------|--------|-----------|
-| TX | Date ieșire BMS | → RX adaptor serial |
-| RX | Date intrare BMS | → TX adaptor serial |
-| GND | Masă | → GND adaptor serial |
+| Pin RJ45 | Semnal | Conectare |
+|----------|--------|-----------|
+| 1..6 | Neutilizați | — |
+| **7** | **RS485 A (Data+)** | → **A** adaptor RS485-USB |
+| **8** | **RS485 B (Data-)** | → **B** adaptor RS485-USB |
 
-> **Atenție:** BMS-ul JBD folosește UART TTL (3.3V sau 5V), nu RS485 diferențial. Adaptorul USB-Serial simplu (FTDI/CH340) este suficient — nu este nevoie de convertor RS485.
+> **Notă:** Portul este etichetat „RS232" pe carcasa BMS-ului, dar pinii 7-8 transportă semnal RS485 diferențial (half-duplex). Este necesar un adaptor **RS485-USB**, nu un simplu adaptor UART/TTL.
+
+> **FTDI vs CH340:** Adaptoarele RS485-USB cu cip FTDI au serial number unic și sunt identificabile stabil prin `/dev/serial/by-id/`. Adaptoarele cu CH340 nu au serial number unic — la reboot pot schimba numărul (`ttyUSB0` ↔ `ttyUSB1`).
 
 ---
 
@@ -120,9 +124,7 @@ usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0
 usb-1a86_USB_Serial-if00-port0
 ```
 
-Copiezi numele FTDI-ului în câmpul `serial_port_by_id`. Astfel portul rămâne fix la orice reboot, indiferent de ordinea de enumerare USB.
-
-> **De ce `by-id`?** Adaptoarele CH340 (chip chinezesc ieftin) nu au serial number unic și nu apar în `by-id`. La reboot pot schimba numărul (`ttyUSB0` ↔ `ttyUSB1`). Adaptoarele FTDI au serial number unic și sunt întotdeauna identificabile stabil.
+Copiezi numele FTDI-ului în câmpul `serial_port_by_id`.
 
 ---
 
@@ -130,7 +132,7 @@ Copiezi numele FTDI-ului în câmpul `serial_port_by_id`. Astfel portul rămâne
 
 ### Senzori
 | Entitate | Unitate | Descriere |
-|----------|---------|-----------|
+|----------|---------|-----------| 
 | BMS Tensiune Pack | V | Tensiunea totală a pack-ului |
 | BMS Curent | A | Curent (+ = descărcare, - = încărcare) |
 | BMS SoC | % | State of Charge |
@@ -161,6 +163,7 @@ Copiezi numele FTDI-ului în câmpul `serial_port_by_id`. Astfel portul rămâne
 
 - **Protocol citire:** JBD 0x78 broadcast request → răspuns cu date complete pack
 - **Protocol scriere MOS:** DD A5 write (comanda `0x5A 0xE1`)
+- **Interfață fizică:** RS485 half-duplex
 - **Viteză:** 19200 bps, 8N1, fără flow control
 - **Request principal:** `01 78 10 00 10 A0 00 00 7F B2`
 
