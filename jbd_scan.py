@@ -1,49 +1,28 @@
 #!/usr/bin/env python3
 """
-jbd_scan.py v2.0 - JBD BMS Protocol Scanner & Diagnostic Tool
+jbd_scan.py v2.1 - JBD BMS Protocol Scanner & Diagnostic Tool
 ==============================================================
-Testeaza protocoalele JBD si logheza RAW + parsed.
+Testeaza exhaustiv toate variantele de protocol si logheza TOT ce primeste.
 
-Protocol JBD (confirmat din joba-1/Joba_JbdBms/jbdbms.h si JBD Protocol V4):
-  Request standard:    DD A5 [CMD] [LEN] [DATA] [CHK_H] [CHK_L] 77
-  Request adresabil:   DD [ADDR] A5 [CMD] [LEN] [DATA] [CHK_H] [CHK_L] 77
-  Response:            DD [CMD] [STATUS] [LEN] [DATA] [CHK_H] [CHK_L] 77
-  STATUS: 0x00=OK, 0x80=error
-  CHECKSUM: -sum(CMD, LEN, DATA...) in 16-bit two's complement
+Variante testate pentru protocolul DD/A5/77:
+  1. Standard:           DD A5 CMD 00 CHK_H CHK_L 77  (big-endian checksum)
+  2. LE checksum:        DD A5 CMD 00 CHK_L CHK_H 77  (little-endian checksum)
+  3. Addr=00 standard:   DD 00 A5 CMD 00 CHK_H CHK_L 77
+  4. Addr=01 standard:   DD 01 A5 CMD 00 CHK_H CHK_L 77
+  5. Addr=00 LE chk:     DD 00 A5 CMD 00 CHK_L CHK_H 77
+  6. Addr=01 LE chk:     DD 01 A5 CMD 00 CHK_L CHK_H 77
 
-Status struct layout (din jbdbms.h, confirmat):
-  [0:2]  voltage           uint16 10mV
-  [2:4]  current           int16  10mA  (+charge, -discharge)
-  [4:6]  remainingCapacity uint16 10mAh
-  [6:8]  nominalCapacity   uint16 10mAh
-  [8:10] cycles            uint16
-  [10:12] productionDate   uint16 (bits: year[15:9] month[8:5] day[4:0])
-  [12:14] balanceLow       uint16 bit per cell 1-16
-  [14:16] balanceHigh      uint16 bit per cell 17-32
-  [16:18] fault            uint16 bit field
-  [18]   version           uint8  (high nibble=major, low=minor)
-  [19]   currentCapacity   uint8  %
-  [20]   mosfetStatus      uint8  (bit0=CHG, bit1=DSG, 1=ON)
-  [21]   cells             uint8
-  [22]   ntcs              uint8
-  [23+]  temperatures      N x uint16, unit 0.1K absolute (0.1K=deciKelvin)
-                           Formula: celsius = (raw - 2731) / 10.0
+Baud rates testate: 9600 si 19200 (sau specificat cu --baud)
 
-NOTA UP16S015 RS485:
-  Modelul UP16S015 (parallel pack BMS) poate folosi varianta adresabila:
-  DD [ADDR] A5 [CMD] ... unde ADDR=01 pentru primul BMS
-  CAUZA TIMEOUT v7.0 scan: am trimis DD A5 03 (fara ADDR byte)
-  Variante testate in acest scan: standard + adresabil ADDR=01 + ADDR=00
+IMPORTANT: Ruleaza CAND BATERIA SE INCARCA sau DESCARCA activ!
+La 100% SOC idle curentul = 0.00A este CORECT.
 
 Rulare:
   pip install pyserial
-  python3 jbd_scan.py /dev/ttyUSB1                        # testeaza 9600 si 19200
-  python3 jbd_scan.py /dev/ttyUSB1 --baud 9600            # baud specific
-  python3 jbd_scan.py /dev/ttyUSB1 --baud 19200 --addr 1  # adresa specifica
-  python3 jbd_scan.py --scan                              # listeaza porturi
-
-Ruleaza CAND BATERIA SE INCARCA sau SE DESCARCA pentru a verifica curentul!
-La 100% SOC idle curentul poate fi 0.00A - e corect.
+  python3 jbd_scan.py /dev/ttyUSB1              # testeaza 9600 + 19200
+  python3 jbd_scan.py /dev/ttyUSB1 --baud 9600
+  python3 jbd_scan.py /dev/ttyUSB1 --baud 19200
+  python3 jbd_scan.py --scan                    # listeaza porturi
 
 Autor: Smart-LK / Claude Sonnet, mai 2026
 """
@@ -80,46 +59,38 @@ log = logging.getLogger("scan")
 p = lambda msg="": log.info(msg)
 
 # =============================================================================
-# CHECKSUM JBD DD/A5/77
-# Covers: CMD, LEN, DATA bytes (NOT start DD, NOT direction A5/5A, NOT stop 77)
-# From jbdbms.h: genCrc(cmd, len, data)
+# FRAME BUILDERS
 # =============================================================================
 
-def jbd_checksum(payload: bytes) -> tuple[int, int]:
-    """
-    Checksum JBD: -sum(payload) in 16-bit two's complement
-    payload = bytes([CMD, LEN, DATA...])
-    """
+def jbd_chk_be(payload: bytes) -> tuple[int, int]:
+    """Standard JBD checksum: big-endian (CHK_H, CHK_L)"""
     s   = sum(payload) & 0xFFFF
     chk = (~s + 1) & 0xFFFF
     return (chk >> 8) & 0xFF, chk & 0xFF
 
+def jbd_chk_le(payload: bytes) -> tuple[int, int]:
+    """Little-endian variant: (CHK_L, CHK_H) - reversed"""
+    h, l = jbd_chk_be(payload)
+    return l, h  # swapped
 
-def build_read_standard(cmd: int) -> bytes:
-    """Request standard: DD A5 CMD 00 CHK_H CHK_L 77"""
-    h, l = jbd_checksum(bytes([cmd, 0x00]))
-    return bytes([0xDD, 0xA5, cmd, 0x00, h, l, 0x77])
-
-
-def build_read_addressed(addr: int, cmd: int) -> bytes:
+def build_dd_request(cmd: int, chk_fn, addr: int = None) -> bytes:
     """
-    Request adresabil (RS485 UP series): DD ADDR A5 CMD 00 CHK_H CHK_L 77
-    Checksum still covers only [CMD, 0x00] (ADDR byte is not in checksum)
-    Ref: 'instead of dd a5, packets start dd 01 a5 where 01 is the bank address'
+    Construieste request DD/A5/77.
+    addr=None -> standard (fara byte adresa)
+    addr=N    -> adresabil (DD ADDR A5 CMD ...)
+    chk_fn    -> jbd_chk_be (standard) sau jbd_chk_le (LE variant)
     """
-    h, l = jbd_checksum(bytes([cmd, 0x00]))
-    return bytes([0xDD, addr & 0xFF, 0xA5, cmd, 0x00, h, l, 0x77])
-
+    h, l = chk_fn(bytes([cmd, 0x00]))
+    if addr is None:
+        return bytes([0xDD, 0xA5, cmd, 0x00, h, l, 0x77])
+    else:
+        return bytes([0xDD, addr & 0xFF, 0xA5, cmd, 0x00, h, l, 0x77])
 
 def build_mos_cmd(xx: int) -> bytes:
     """MOS write: DD 5A E1 02 00 XX CHK_H CHK_L 77"""
     data = bytes([0x00, xx])
-    h, l = jbd_checksum(bytes([0xE1, 0x02]) + data)
+    h, l = jbd_chk_be(bytes([0xE1, 0x02]) + data)
     return bytes([0xDD, 0x5A, 0xE1, 0x02]) + data + bytes([h, l, 0x77])
-
-# =============================================================================
-# CRC16 MODBUS (pentru protocolul 0x78 proprietar din addon v6.x)
-# =============================================================================
 
 def crc16_modbus(data: bytes) -> int:
     crc = 0xFFFF
@@ -141,59 +112,108 @@ def build_request_78(addr: int, start_reg: int, end_reg: int) -> bytes:
 # RECEIVE
 # =============================================================================
 
-def recv_raw(ser, timeout: float = 3.0) -> bytes:
-    buf = bytearray(); start = time.time()
+def recv_raw_all(ser, timeout: float = 3.0) -> bytes:
+    """Citeste TOT ce vine pe serial in timeout secunde. Fara filtrare."""
+    buf = bytearray(); start = time.time(); last_rx = time.time()
     while time.time() - start < timeout:
         chunk = ser.read(256)
-        if chunk: buf.extend(chunk); start = time.time()
-        elif buf: break
+        if chunk:
+            buf.extend(chunk)
+            last_rx = time.time()
+        else:
+            # Daca am primit ceva si e liniste > 0.5s, consideram raspunsul complet
+            if buf and (time.time() - last_rx > 0.5):
+                break
         time.sleep(0.02)
     return bytes(buf)
 
-
-def recv_dd_response(ser, expected_cmd: int, timeout: float = 3.0) -> tuple:
+def parse_raw_response(raw: bytes, expected_cmd: int) -> dict:
     """
-    Primeste raspuns DD/CMD/STATUS/LEN/DATA/CHK/77.
-    Suporta atat raspunsul standard cat si cel adresabil.
-    Returneaza (payload, status_str) sau (None, eroare).
+    Incearca sa parseze raspunsul in mai multe formate:
+    - DD/A5/77 standard (big-endian chk, CMD la offset 1)
+    - DD/A5/77 adresabil (CMD la offset 2, cu ADDR la offset 1)
+    - Frame inversat (incepe cu 0x77)
+    - Orice alta secventa care contine 0xDD
     """
-    buf = bytearray(); start = time.time()
-    while time.time() - start < timeout:
-        chunk = ser.read(256)
-        if chunk: buf.extend(chunk)
-        while len(buf) > 0 and buf[0] != 0xDD: buf = buf[1:]
-        if len(buf) < 4: time.sleep(0.01); continue
-        # Detecteaza daca e format standard (DD CMD ...) sau adresabil (DD ADDR CMD ...)
-        # Standard:  DD [CMD] [STATUS] [LEN] ...
-        # Adresabil: DD [ADDR] [CMD] [STATUS] [LEN] ...
-        # Diferenta: in standard buf[1]=CMD, in adresabil buf[1]=ADDR (!=0xDD,!=cmd)
-        # Incercam ambele formate
-        for offset in [0, 1]:  # 0=standard, 1=adresabil
-            if len(buf) < 4 + offset: continue
-            cmd    = buf[1 + offset]
-            status = buf[2 + offset]
-            length = buf[3 + offset]
-            if cmd != expected_cmd: continue
-            total = (1 + offset) + 1 + 1 + 1 + length + 2 + 1  # DD[+ADDR]+CMD+STATUS+LEN+DATA+CHK+77
-            if len(buf) < total: break
-            if buf[total - 1] != 0x77: break
-            frame = bytes(buf[:total])
-            buf   = buf[total:]
-            if status != 0x00: return None, f"BMS_ERROR 0x{status:02X}"
-            data_start = 1 + offset + 3  # after DD[+ADDR]+CMD+STATUS+LEN
-            data  = frame[data_start:data_start + length]
-            chk_h = frame[data_start + length]
-            chk_l = frame[data_start + length + 1]
-            exp_h, exp_l = jbd_checksum(bytes([cmd, length]) + data)
-            ok_str = "OK" if (exp_h==chk_h and exp_l==chk_l) else f"CHK_MISMATCH(exp={exp_h:02X}{exp_l:02X} got={chk_h:02X}{chk_l:02X})"
-            fmt = "adresabil" if offset==1 else "standard"
-            return data, f"{ok_str} ({fmt} format)"
-        time.sleep(0.01)
-    return None, "TIMEOUT"
+    result = {
+        'raw_hex': raw.hex(' ').upper() if raw else '',
+        'len': len(raw),
+        'format_detected': None,
+        'data': None,
+    }
 
-# =============================================================================
-# PARSE DD/A5/77 STATUS (0x03) - conform jbdbms.h Status_t
-# =============================================================================
+    if not raw:
+        result['error'] = 'empty'
+        return result
+
+    # Afiseaza hex dump
+    p(f"  RX ({len(raw)} bytes):")
+    for i in range(0, len(raw), 16):
+        ch = raw[i:i+16]
+        ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in ch)
+        p(f"    {i:04X}: {' '.join(f'{b:02X}' for b in ch):<48} |{ascii_part}|")
+
+    # Analiza byte-cu-byte
+    p(f"  Analiza byte-cu-byte:")
+    p(f"    byte[0]  = 0x{raw[0]:02X} {'= START 0xDD ✓' if raw[0]==0xDD else '≠ 0xDD'}")
+    if len(raw) > 1:
+        p(f"    byte[1]  = 0x{raw[1]:02X} {'= CMD 0x03 (standard)' if raw[1]==0x03 else f'= 0x{raw[1]:02X}'}")
+    if len(raw) > 6:
+        p(f"    byte[-1] = 0x{raw[-1]:02X} {'= STOP 0x77 ✓' if raw[-1]==0x77 else '≠ 0x77'}")
+        p(f"    byte[-2] = 0x{raw[-2]:02X}  (CHK_L)")
+        p(f"    byte[-3] = 0x{raw[-3]:02X}  (CHK_H)")
+
+    # Cauta 0xDD in raspuns
+    dd_positions = [i for i, b in enumerate(raw) if b == 0xDD]
+    p(f"  Pozitii 0xDD in raspuns: {dd_positions if dd_positions else 'nicaieri'} ← START byte")
+    p(f"  Pozitii 0x77 in raspuns: {[i for i, b in enumerate(raw) if b==0x77]} ← STOP byte")
+    p(f"  Pozitii 0xA5 in raspuns: {[i for i, b in enumerate(raw) if b==0xA5]} ← READ direction")
+
+    # Incearca variante de parsare
+    for start_offset in range(min(4, len(raw))):
+        buf = raw[start_offset:]
+        if len(buf) < 7: continue
+
+        # Detecteaza: DD CMD STATUS LEN DATA CHK_H CHK_L 77
+        if buf[0] == 0xDD:
+            for cmd_offset in [1, 2]:  # standard sau adresabil
+                if len(buf) <= cmd_offset + 3: continue
+                cmd    = buf[cmd_offset]
+                status = buf[cmd_offset + 1]
+                length = buf[cmd_offset + 2]
+                total  = cmd_offset + 3 + length + 2 + 1
+                if len(buf) < total: continue
+                if buf[total - 1] != 0x77: continue
+                if cmd != expected_cmd: continue
+
+                data  = buf[cmd_offset + 3:cmd_offset + 3 + length]
+                chk_h = buf[cmd_offset + 3 + length]
+                chk_l = buf[cmd_offset + 3 + length + 1]
+                exp_h, exp_l = jbd_chk_be(bytes([cmd, length]) + data)
+
+                fmt = f"DD/A5/77 {'adresabil' if cmd_offset==2 else 'standard'}"
+                if exp_h == chk_h and exp_l == chk_l:
+                    p(f"  FORMAT DETECTAT: {fmt} cu checksum BE CORECT ✓")
+                    result['format_detected'] = fmt + ' BE'
+                    result['data'] = data
+                    result['status'] = status
+                    return result
+                else:
+                    # Incearca si LE
+                    if exp_l == chk_h and exp_h == chk_l:
+                        p(f"  FORMAT DETECTAT: {fmt} cu checksum LE CORECT ✓")
+                        result['format_detected'] = fmt + ' LE'
+                        result['data'] = data
+                        result['status'] = status
+                        return result
+                    else:
+                        p(f"  Posibil {fmt}: CMD=0x{cmd:02X} STATUS=0x{status:02X} LEN={length} "
+                          f"CHK_got={chk_h:02X}{chk_l:02X} CHK_exp_BE={exp_h:02X}{exp_l:02X} "
+                          f"CHK_exp_LE={exp_l:02X}{exp_h:02X}")
+
+    result['format_detected'] = 'unknown'
+    return result
+
 
 FAULT_BITS = {
     0x0001: "cell_overvoltage",    0x0002: "cell_undervoltage",
@@ -205,226 +225,151 @@ FAULT_BITS = {
     0x1000: "sw_lock_mos",
 }
 
-
 def parse_status_0x03(data: bytes) -> dict:
-    """
-    Parse DD 0x03 response payload (Status_t din jbdbms.h).
-
-    Layout EXACT din jbdbms.h:
-    [0:2]  voltage            uint16  10mV
-    [2:4]  current            int16   10mA  (+charge, -discharge)
-    [4:6]  remainingCapacity  uint16  10mAh
-    [6:8]  nominalCapacity    uint16  10mAh
-    [8:10] cycles             uint16
-    [10:12] productionDate    uint16
-    [12:14] balanceLow        uint16
-    [14:16] balanceHigh       uint16
-    [16:18] fault             uint16
-    [18]   version            uint8
-    [19]   currentCapacity    uint8   %
-    [20]   mosfetStatus       uint8   (bit0=CHG, bit1=DSG, 1=ON)
-    [21]   cells              uint8
-    [22]   ntcs               uint8
-    [23+]  temperatures       N*2 bytes, unit 0.1K absolute
-           Formula: celsius = (raw - 2731) / 10.0
-           Exemplu: 0x0B98=2968 -> (2968-2731)/10 = 23.7C
-    """
-    MIN = 23
-    if len(data) < MIN:
-        return {"error": f"date prea scurte: {len(data)} < {MIN}"}
-
+    """Parse DD 0x03 payload per jbdbms.h Status_t."""
+    if len(data) < 23:
+        return {"error": f"prea scurt: {len(data)} < 23"}
     r = {}
-    r['voltage_v']  = round(struct.unpack('>H', data[0:2])[0] / 100.0, 2)  # 10mV -> V
-
-    # Current SIGNED int16, 10mA -> A
-    # NOTA: la 100% SOC idle, curentul POATE fi 0.0A (corect!)
-    # Ruleaza scanul cand bateria e activ incarcata/descarcata pt verificare
-    current_raw  = struct.unpack('>h', data[2:4])[0]
-    r['current_a']           = round(current_raw / 100.0, 2)
-    r['current_raw_signed']  = current_raw
-    r['current_raw_hex']     = f"0x{struct.unpack('>H', data[2:4])[0]:04X}"
-    r['current_direction']   = "CHARGING(+)" if current_raw > 0 else ("DISCHARGING(-)" if current_raw < 0 else "IDLE(0) - normal la 100% SOC!")
-
-    r['cap_remaining_ah'] = round(struct.unpack('>H', data[4:6])[0] * 10 / 1000, 2)
-    r['cap_nominal_ah']   = round(struct.unpack('>H', data[6:8])[0] * 10 / 1000, 2)
-    r['cycles']           = struct.unpack('>H', data[8:10])[0]
-
-    date_raw = struct.unpack('>H', data[10:12])[0]
-    try:
-        r['production_date'] = f"{2000+(date_raw>>9):04d}-{(date_raw>>5)&0x0F:02d}-{date_raw&0x1F:02d}"
-    except:
-        r['production_date'] = f"raw=0x{date_raw:04X}"
-
-    r['balance_low_hex']  = f"0x{struct.unpack('>H', data[12:14])[0]:04X}"
-    r['balance_high_hex'] = f"0x{struct.unpack('>H', data[14:16])[0]:04X}"
-
-    fault = struct.unpack('>H', data[16:18])[0]
-    r['fault_raw']    = f"0x{fault:04X}"
-    r['fault_active'] = [desc for mask, desc in FAULT_BITS.items() if fault & mask] or ["none"]
-
-    sw = data[18]
-    r['software_version'] = f"V{sw >> 4}.{sw & 0x0F}"
-    r['soc_pct']          = data[19]
-
-    fet = data[20]
-    r['fet_raw']       = f"0x{fet:02X}"
-    r['charge_mos']    = "ON" if (fet & 0x01) else "OFF"  # bit0
-    r['discharge_mos'] = "ON" if (fet & 0x02) else "OFF"  # bit1
-
-    r['num_cells'] = data[21]
-    num_ntc = data[22]; r['num_ntc'] = num_ntc
-
-    # Temperaturi: unit 0.1K absolut
-    # FORMULA: celsius = (raw - 2731) / 10.0 (din jbdbms.h: deciCelsius = deciKelvin - 2731)
-    # Exemplu din PDF: 0x0B98=2968 -> (2968-2731)/10 = 23.7C
-    temps = []
-    for i in range(num_ntc):
+    r['voltage_v']          = round(struct.unpack('>H', data[0:2])[0] / 100.0, 2)
+    current_raw             = struct.unpack('>h', data[2:4])[0]
+    r['current_a']          = round(current_raw / 100.0, 2)
+    r['current_raw']        = current_raw
+    r['current_raw_hex']    = f"0x{struct.unpack('>H', data[2:4])[0]:04X}"
+    r['current_dir']        = "CHARGE(+)" if current_raw > 0 else ("DISCHARGE(-)" if current_raw < 0 else "IDLE(0) - corect la SOC=100%!")
+    r['cap_remaining_ah']   = round(struct.unpack('>H', data[4:6])[0] * 10 / 1000, 2)
+    r['cap_nominal_ah']     = round(struct.unpack('>H', data[6:8])[0] * 10 / 1000, 2)
+    r['cycles']             = struct.unpack('>H', data[8:10])[0]
+    date_raw                = struct.unpack('>H', data[10:12])[0]
+    try:    r['production_date'] = f"{2000+(date_raw>>9):04d}-{(date_raw>>5)&0x0F:02d}-{date_raw&0x1F:02d}"
+    except: r['production_date'] = f"raw=0x{date_raw:04X}"
+    r['balance_low_hex']    = f"0x{struct.unpack('>H', data[12:14])[0]:04X}"
+    r['balance_high_hex']   = f"0x{struct.unpack('>H', data[14:16])[0]:04X}"
+    fault                   = struct.unpack('>H', data[16:18])[0]
+    r['fault_raw']          = f"0x{fault:04X}"
+    r['faults']             = [desc for mask, desc in FAULT_BITS.items() if fault & mask] or ["none"]
+    sw                      = data[18]
+    r['sw_version']         = f"V{sw>>4}.{sw&0x0F}"
+    r['soc_pct']            = data[19]
+    fet                     = data[20]
+    r['fet_raw']            = f"0x{fet:02X}"
+    r['charge_mos']         = "ON" if (fet & 0x01) else "OFF"
+    r['discharge_mos']      = "ON" if (fet & 0x02) else "OFF"
+    r['num_cells']          = data[21]
+    r['num_ntc']            = data[22]
+    # Temperaturi: 0.1K absolut, celsius = (raw - 2731) / 10 (din jbdbms.h deciCelsius)
+    r['temperatures']       = []
+    for i in range(data[22]):
         off = 23 + i * 2
         if off + 2 <= len(data):
             raw_t = struct.unpack('>H', data[off:off+2])[0]
-            temps.append({
-                'raw': raw_t, 'hex': f"0x{raw_t:04X}",
-                'celsius': round((raw_t - 2731) / 10.0, 1),
-            })
-    r['temperatures'] = temps
+            r['temperatures'].append({'raw': raw_t, 'hex': f"0x{raw_t:04X}", 'celsius': round((raw_t-2731)/10.0, 1)})
     r['power_w'] = round(r['voltage_v'] * r['current_a'], 1)
     return r
 
-
 def parse_cells_0x04(data: bytes) -> dict:
-    """Parse DD 0x04 response payload (Cells_t din jbdbms.h)."""
-    if len(data) < 2 or len(data) % 2 != 0:
-        return {"error": f"invalid len={len(data)}"}
+    if len(data) < 2 or len(data) % 2 != 0: return {"error": f"len={len(data)}"}
     n = len(data) // 2
     cells = [struct.unpack('>H', data[i*2:i*2+2])[0] for i in range(n)]
-    return {
-        'num_cells': n, 'cells_mv': cells,
-        'min_mv': min(cells), 'max_mv': max(cells),
-        'delta_mv': max(cells) - min(cells),
-        'avg_mv': round(sum(cells) / n, 1),
-        'sum_mv': sum(cells),
-    }
+    return {'n': n, 'cells': cells, 'min': min(cells), 'max': max(cells),
+            'delta': max(cells)-min(cells), 'avg': round(sum(cells)/n, 1), 'sum': sum(cells)}
 
-
-def parse_hw_0x05(data: bytes) -> dict:
-    """Parse DD 0x05 response (Hardware_t din jbdbms.h)."""
-    try: hw = data.decode('ascii', errors='replace').strip()
-    except: hw = data.hex()
-    return {'hardware_id': hw, 'raw_hex': data.hex()}
+def parse_hw_0x05(data: bytes) -> str:
+    try:    return data.decode('ascii', errors='replace').strip()
+    except: return data.hex()
 
 # =============================================================================
-# SCANARE PROTOCOL DD/A5/77 (standard + adresabil)
+# TEST DD/A5/77 CU CAPTURA RAW
 # =============================================================================
 
-def scan_dd_protocol(ser, baud: int, addr: int = None):
+def test_dd_variant(ser, req: bytes, label: str, expected_cmd: int, timeout: float = 3.0) -> dict:
     """
-    Testeaza protocolul DD/A5/77.
-    addr=None: testeaza varianta standard (fara byte adresa)
-    addr=N:    testeaza varianta adresabila (DD ADDR A5 CMD ...)
+    Trimite cererea si captureaza RAW tot ce vine.
+    Incearca sa parseze in orice format posibil.
     """
-    if addr is None:
-        label = "DD/A5/77 Standard"
-        build_req = lambda cmd: build_read_standard(cmd)
-    else:
-        label = f"DD/A5/77 Adresabil ADDR=0x{addr:02X}"
-        build_req = lambda cmd: build_read_addressed(addr, cmd)
+    p(f"  --- {label} ---")
+    p(f"  TX ({len(req)} bytes): {req.hex(' ').upper()}")
+    ser.reset_input_buffer()
+    ser.write(req)
+    # Pauza scurta pentru flush
+    time.sleep(0.1)
+    # Citeste raw, fara filtrare
+    raw = recv_raw_all(ser, timeout=timeout)
+    if not raw:
+        p(f"  RX: NIMIC (timeout {timeout}s)")
+        return {'ok': False, 'raw': b''}
 
+    result = parse_raw_response(raw, expected_cmd)
+    if result.get('data') is not None:
+        p(f"  >>> SUCCES! Format: {result['format_detected']}")
+        return {'ok': True, 'raw': raw, 'data': result['data'], 'status': result.get('status')}
+    return {'ok': False, 'raw': raw}
+
+
+def scan_all_dd_variants(ser, baud: int, cmds=(0x03, 0x04, 0x05)):
+    """Testeaza TOATE variantele DD/A5/77 pentru fiecare comanda."""
     p(); p("="*65)
-    p(f"  {label} @ {baud} bps")
+    p(f"  DD/A5/77 - Toate variantele @ {baud} bps")
     p("="*65)
-    results = {}
 
-    for cmd, name in [(0x03, "Basic Info & Status"), (0x04, "Cell Voltages"), (0x05, "Hardware Version")]:
-        req = build_req(cmd)
-        p(); p(f"  [{label[:5]}-{cmd:02X}] READ 0x{cmd:02X} - {name}")
-        p(f"  TX ({len(req)} bytes): {req.hex(' ').upper()}")
+    # Defineste toate variantele de request
+    variants = [
+        ("Standard BE",       None,  jbd_chk_be),
+        ("Standard LE chk",   None,  jbd_chk_le),
+        ("Addr=0x00 BE",      0x00,  jbd_chk_be),
+        ("Addr=0x00 LE chk",  0x00,  jbd_chk_le),
+        ("Addr=0x01 BE",      0x01,  jbd_chk_be),
+        ("Addr=0x01 LE chk",  0x01,  jbd_chk_le),
+    ]
 
-        ser.reset_input_buffer(); ser.write(req)
-        time.sleep(0.2)
-        data, status = recv_dd_response(ser, cmd)
+    found_variant = None
 
-        if data is not None:
-            p(f"  RX ({len(data)} bytes): {data.hex(' ').upper()}")
-            p(f"  Checksum+Format: {status}")
+    for cmd, name in [(0x03, "Basic Info"), (0x04, "Cell Voltages"), (0x05, "HW Version")]:
+        if cmd not in cmds:
+            continue
+        p(); p(f"  === CMD 0x{cmd:02X} - {name} ===")
 
-            if cmd == 0x03:
-                parsed = parse_status_0x03(data)
-                results['cmd03'] = {'status': status, 'raw': data.hex(), 'parsed': parsed}
-                p(); p("  === PARSED 0x03 (Status_t din jbdbms.h) ===")
-                p(f"  Tensiune:           {parsed.get('voltage_v')} V")
-                p(f"  Curent (signed):    {parsed.get('current_a')} A")
-                p(f"    hex: {parsed.get('current_raw_hex')} = {parsed.get('current_raw_signed')} (10mA units)")
-                p(f"    directie: {parsed.get('current_direction')}")
-                p(f"  Putere:             {parsed.get('power_w')} W")
-                p(f"  SoC:                {parsed.get('soc_pct')} %")
-                p(f"  Cap. ramasa:        {parsed.get('cap_remaining_ah')} Ah  (raw x10mAh)")
-                p(f"  Cap. nominala:      {parsed.get('cap_nominal_ah')} Ah  (raw x10mAh)")
-                p(f"  Cicluri:            {parsed.get('cycles')}")
-                p(f"  Data productie:     {parsed.get('production_date')}")
-                p(f"  Balance low:        {parsed.get('balance_low_hex')}")
-                p(f"  Balance high:       {parsed.get('balance_high_hex')}")
-                p(f"  Fault raw:          {parsed.get('fault_raw')}")
-                p(f"  Faulturi active:    {', '.join(parsed.get('fault_active', []))}")
-                p(f"  Versiune SW:        {parsed.get('software_version')}")
-                p(f"  FET status:         raw={parsed.get('fet_raw')} CHG={parsed.get('charge_mos')} DSG={parsed.get('discharge_mos')}")
-                p(f"  Numar celule:       {parsed.get('num_cells')}")
-                p(f"  Numar NTC:          {parsed.get('num_ntc')}")
-                p(f"  NOTA temperaturi:   formula din jbdbms.h: (raw-2731)/10 = Celsius")
-                for i, t in enumerate(parsed.get('temperatures', [])):
-                    p(f"  Temp T{i+1}:           {t['celsius']} C  (raw={t['raw']} = {t['hex']})")
+        for var_name, addr, chk_fn in variants:
+            req = build_dd_request(cmd, chk_fn, addr)
+            label = f"{var_name} (0x{cmd:02X})"
+            res = test_dd_variant(ser, req, label, cmd, timeout=2.5)
+            time.sleep(0.3)
 
-            elif cmd == 0x04:
-                parsed = parse_cells_0x04(data)
-                results['cmd04'] = {'status': status, 'raw': data.hex(), 'parsed': parsed}
-                p(); p("  === PARSED 0x04 ===")
-                p(f"  Numar celule:  {parsed.get('num_cells')}")
-                p(f"  Min:   {parsed.get('min_mv')} mV")
-                p(f"  Max:   {parsed.get('max_mv')} mV")
-                p(f"  Delta: {parsed.get('delta_mv')} mV")
-                p(f"  Avg:   {parsed.get('avg_mv')} mV")
-                p(f"  Sum:   {parsed.get('sum_mv')} mV = {parsed.get('sum_mv')/1000:.2f} V")
-                for i, v in enumerate(parsed.get('cells_mv', [])):
-                    p(f"  C{i+1:02d}: {v} mV")
+            if res['ok']:
+                data = res['data']
+                p(f"  PARSE 0x{cmd:02X}:")
+                if cmd == 0x03:
+                    pr = parse_status_0x03(data)
+                    p(f"    V={pr.get('voltage_v')}V I={pr.get('current_a')}A ({pr.get('current_dir')})")
+                    p(f"    SoC={pr.get('soc_pct')}% Cap={pr.get('cap_remaining_ah')}Ah")
+                    p(f"    CHG={pr.get('charge_mos')} DSG={pr.get('discharge_mos')}")
+                    for t in pr.get('temperatures', []):
+                        p(f"    Temp: {t['celsius']}C (raw={t['hex']})")
+                elif cmd == 0x04:
+                    pr = parse_cells_0x04(data)
+                    p(f"    {pr.get('n')} celule: min={pr.get('min')}mV max={pr.get('max')}mV delta={pr.get('delta')}mV")
+                    for i, v in enumerate(pr.get('cells', [])):
+                        p(f"    C{i+1:02d}: {v} mV")
+                elif cmd == 0x05:
+                    p(f"    HW: '{parse_hw_0x05(data)}'")
 
-            elif cmd == 0x05:
-                parsed = parse_hw_0x05(data)
-                results['cmd05'] = {'status': status, 'raw': data.hex(), 'parsed': parsed}
-                p(); p("  === PARSED 0x05 ===")
-                p(f"  Hardware ID: '{parsed.get('hardware_id')}'")
-                p(f"  Raw hex: {parsed.get('raw_hex')}")
-        else:
-            p(f"  ESUAT: {status}")
-            results[f'cmd{cmd:02x}'] = {'status': status, 'error': True}
-        time.sleep(0.3)
+                if found_variant is None:
+                    found_variant = (baud, var_name, cmd)
 
-    # MOS frames (fara trimitere)
-    p(); p("  MOS frames (FARA TRIMITERE):")
-    for xx, desc in [(0x00,"release all"),(0x01,"CHG off"),(0x02,"DSG off"),(0x03,"both off")]:
-        p(f"  XX=0x{xx:02X} ({desc:12s}): {build_mos_cmd(xx).hex(' ').upper()}")
-
-    ok = sum(1 for r in results.values() if not r.get('error'))
-    p(); p(f"  === SUMAR {label}: {ok}/{len(results)} comenzi OK ===")
-    if ok >= 2:
-        p(f"  >>> FUNCTIONAL! Foloseste acest protocol in addon.")
-        if results.get('cmd03') and not results['cmd03'].get('error'):
-            pr = results['cmd03']['parsed']
-            p(f"  >>> Curent: {pr.get('current_a')} A  ({pr.get('current_direction')})")
-    else:
-        p(f"  >>> NEFUNCTIONAL pe acest port/baud/adresa")
-    return results
+    return found_variant
 
 # =============================================================================
-# SCANARE PROTOCOL 0x78 REGISTRI (protocol proprietar addon v6.x)
+# SCANARE PROTOCOL 0x78 CU PARSARE COMPLETA
 # =============================================================================
 
-def scan_protocol_78(ser, baud: int):
+def scan_protocol_78(ser, baud: int) -> dict:
     p(); p("="*65)
-    p(f"  PROTOCOL 0x78 Registri (addon v6.x) @ {baud} bps")
+    p(f"  PROTOCOL 0x78 Registri @ {baud} bps")
     p("="*65)
     req = build_request_78(0x01, 0x1000, 0x10A0)
     p(f"  TX: {req.hex(' ').upper()}")
-    ser.reset_input_buffer(); ser.write(req); time.sleep(0.5)
-    raw = recv_raw(ser, timeout=4.0)
+    ser.reset_input_buffer(); ser.write(req)
+    time.sleep(0.5)
+    raw = recv_raw_all(ser, timeout=4.0)
 
     if not raw:
         p("  TIMEOUT"); return {'ok': False}
@@ -432,58 +377,97 @@ def scan_protocol_78(ser, baud: int):
     p(f"  RX ({len(raw)} bytes):")
     for i in range(0, len(raw), 16):
         ch = raw[i:i+16]
-        p(f"    {i:04X}: {' '.join(f'{b:02X}' for b in ch):<48}")
+        ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in ch)
+        p(f"    {i:04X}: {' '.join(f'{b:02X}' for b in ch):<48} |{ascii_part}|")
 
     if len(raw) < 10 or raw[0] != 0x01 or raw[1] != 0x78:
-        p("  Header invalid"); return {'ok': False}
+        p("  Header 0x78 invalid"); return {'ok': False}
 
     data_len = struct.unpack('>H', raw[6:8])[0]
-    payload  = raw[8:8+data_len]
-    p(f"  Header OK: data_len={data_len}")
+    payload  = raw[8:8 + data_len]
+    p(f"  Header OK: data_len={data_len}, payload={len(payload)} bytes")
 
-    if len(payload) >= 4:
-        v_raw   = struct.unpack('>H', payload[0:2])[0]
-        i_raw_s = struct.unpack('>h', payload[2:4])[0]  # SIGNED
-        p(); p("  === DATE 0x78 (payload offset 0-3) ===")
-        p(f"  [0:2] Tensiune:  0x{v_raw:04X} = {v_raw} -> {v_raw/100.0:.2f} V")
-        p(f"  [2:4] Curent:    0x{struct.unpack('>H', payload[2:4])[0]:04X} = {i_raw_s} (signed) -> {i_raw_s/100.0:.2f} A")
-        p(f"         Directie: {'CHARGING(+)' if i_raw_s>0 else 'DISCHARGING(-)' if i_raw_s<0 else 'IDLE - corect la baterie plina!'}")
+    if len(payload) < 4:
+        return {'ok': False}
 
-        if len(payload) > 8:
-            nc_raw = struct.unpack('>H', payload[6:8])[0]
-            p(f"  [6:8] = 0x{nc_raw:04X} = {nc_raw} -> v6.x il folosea ca curent GRESIT!")
-            p(f"         v6.x: ({nc_raw}-37403)/114.2 = {(nc_raw-37403)/114.2:.2f} A  <- INCORECT")
-            p(f"         v7.1: [2:4] signed / 100 = {i_raw_s/100.0:.2f} A  <- CORECT")
+    # Parsare completa payload
+    p(); p("  === PARSARE COMPLETA PAYLOAD 0x78 ===")
 
-        p(f"  Tensiune verificare: {v_raw/100.0:.2f} V (matches BMS display?)")
-        p(f"  Curent: {i_raw_s/100.0:.2f} A  (0.0A = normal la 100% SOC/idle!)")
+    v_raw   = struct.unpack('>H', payload[0:2])[0]
+    i_raw_s = struct.unpack('>h', payload[2:4])[0]
+    p(f"  [0:2]   0x{v_raw:04X} = {v_raw}  -> tensiune: {v_raw/100.0:.2f} V")
+    p(f"  [2:4]   0x{struct.unpack('>H', payload[2:4])[0]:04X} = {i_raw_s} (signed) -> curent: {i_raw_s/100.0:.2f} A")
+    p(f"          directie: {'CHARGE(+)' if i_raw_s>0 else 'DISCHARGE(-)' if i_raw_s<0 else 'IDLE(0) - normal la 100% SOC'}")
 
-    return {'ok': True, 'voltage': raw[8]/100.0 if len(raw)>8 else None}
+    for off in range(4, min(24, len(payload)), 2):
+        raw_val = struct.unpack('>H', payload[off:off+2])[0]
+        p(f"  [{off}:{off+2}]   0x{raw_val:04X} = {raw_val:6d}  (unsigned) / {struct.unpack('>h', payload[off:off+2])[0]:7d} (signed)")
+
+    # SOC confirmat
+    if len(payload) > 24:
+        soc_val = struct.unpack('>H', payload[22:24])[0] & 0xFF
+        p(f"  [22:24] 0x{struct.unpack('>H', payload[22:24])[0]:04X} = {soc_val} -> SOC: {soc_val}% {'✓' if soc_val <= 100 else '?'}")
+
+    # Num celule
+    if len(payload) > 68:
+        num_cells = struct.unpack('>H', payload[66:68])[0]
+        p(f"  [66:68] 0x{num_cells:04X} = {num_cells} -> num_cells={'✓ ' + str(num_cells) if 0 < num_cells <= 32 else '?'}")
+
+        # Tensiuni celule
+        if 0 < num_cells <= 32:
+            cells_end = 68 + num_cells * 2
+            if len(payload) >= cells_end:
+                cells = [struct.unpack('>H', payload[68+i*2:70+i*2])[0] for i in range(num_cells)]
+                p(f"  Celule ({num_cells}): min={min(cells)} max={max(cells)} delta={max(cells)-min(cells)} sum={sum(cells)}mV={sum(cells)/1000:.2f}V")
+                for i, v in enumerate(cells):
+                    p(f"    C{i+1:02d}: {v} mV")
+
+                # NTC
+                if len(payload) > cells_end + 2:
+                    num_ntc = struct.unpack('>H', payload[cells_end:cells_end+2])[0]
+                    p(f"  num_ntc={num_ntc}")
+                    for i in range(min(num_ntc, 5)):
+                        off = cells_end + 2 + i * 2
+                        if off + 2 <= len(payload):
+                            raw_t = struct.unpack('>H', payload[off:off+2])[0]
+                            # Formula (raw-500)/10:
+                            t500 = round((raw_t - 500) / 10.0, 1)
+                            # Formula (raw-2731)/10 (standard jbdbms.h):
+                            t2731 = round((raw_t - 2731) / 10.0, 1)
+                            p(f"  NTC T{i+1}: raw=0x{raw_t:04X}={raw_t} -> (raw-500)/10={t500}C  (raw-2731)/10={t2731}C")
+                            p(f"             Probabil corect: {'(raw-500)/10=' + str(t500) + 'C' if 0 < t500 < 80 else ''} {'(raw-2731)/10=' + str(t2731) + 'C' if 0 < t2731 < 80 else ''}")
+
+    # Device name ASCII
+    # Cauta sirul "JBD" in payload
+    jbd_pos = payload.find(b'JBD')
+    if jbd_pos >= 0:
+        name_bytes = payload[jbd_pos:jbd_pos+20].split(b'\x00')[0]
+        try:    name = name_bytes.decode('ascii')
+        except: name = name_bytes.hex()
+        p(f"  Device name la offset {jbd_pos}: '{name}'")
+
+    # v6.x vs v7.1 comparatie
+    if len(payload) > 8:
+        nc_raw = struct.unpack('>H', payload[6:8])[0]
+        p(); p("  === COMPARATIE v6.x vs v7.1 ===")
+        p(f"  v6.x (GRESIT): payload[6:8]=0x{nc_raw:04X}={nc_raw}, ({nc_raw}-37403)/114.2 = {(nc_raw-37403)/114.2:.2f} A")
+        p(f"  v7.1 (CORECT): payload[2:4] signed = {i_raw_s}/100 = {i_raw_s/100.0:.2f} A")
+
+    return {'ok': True, 'voltage': v_raw/100.0, 'current': i_raw_s/100.0, 'payload': payload}
 
 # =============================================================================
 # VERIFICARE CHECKSUM
 # =============================================================================
 
-def verify_checksum_examples():
-    p(); p("="*65); p("  VERIFICARE CHECKSUM - Exemple din protocol v4 PDF")
-    p("  Confirmat cu implementarea din joba-1/Joba_JbdBms/jbdbms.h")
-    p("="*65)
-    tests = [
-        ("Read 0x03 standard",    build_read_standard(0x03),   bytes([0xDD,0xA5,0x03,0x00,0xFF,0xFD,0x77])),
-        ("Read 0x04 standard",    build_read_standard(0x04),   bytes([0xDD,0xA5,0x04,0x00,0xFF,0xFC,0x77])),
-        ("Read 0x05 standard",    build_read_standard(0x05),   bytes([0xDD,0xA5,0x05,0x00,0xFF,0xFB,0x77])),
-        ("Read 0x03 addr=01",     build_read_addressed(0x01,0x03), None),  # no reference to compare
-        ("MOS DSG off (XX=02)",   build_mos_cmd(0x02),         bytes([0xDD,0x5A,0xE1,0x02,0x00,0x02,0xFF,0x1B,0x77])),
-    ]
-    for name, built, expected in tests:
-        p(f"  {name}:")
-        p(f"    Construit: {built.hex(' ').upper()}")
-        if expected:
-            match = built == expected
-            p(f"    Asteptat:  {expected.hex(' ').upper()}")
-            p(f"    Status:    {'OK' if match else 'MISMATCH'}")
-        else:
-            p(f"    (fara referinta de comparatie - nou in v2.0)")
+def verify_checksums():
+    p(); p("="*65); p("  VERIFICARE CHECKSUM - BE vs LE"); p("="*65)
+    for cmd in [0x03, 0x04, 0x05]:
+        req_be = build_dd_request(cmd, jbd_chk_be)
+        req_le = build_dd_request(cmd, jbd_chk_le)
+        p(f"  CMD 0x{cmd:02X}:")
+        p(f"    Standard BE: {req_be.hex(' ').upper()}")
+        p(f"    LE checksum: {req_le.hex(' ').upper()} (CHK bytes inversate)")
+    p(f"  MOS (DSG off): {build_mos_cmd(0x02).hex(' ').upper()}")
 
 # =============================================================================
 # PORT SERIAL
@@ -510,91 +494,80 @@ def scan_ports() -> list:
 
 def main():
     setup_logger()
-    parser = argparse.ArgumentParser(description="JBD BMS Protocol Scanner v2.0")
-    parser.add_argument("port",    nargs="?", default=None)
-    parser.add_argument("--baud",  type=int,  default=None, help="Baud (implicit: testeaza 9600 si 19200)")
-    parser.add_argument("--addr",  type=lambda x:int(x,0), default=None,
-                        help="Adresa RS485 specifica (implicit: testeaza standard + 0x00 + 0x01)")
+    parser = argparse.ArgumentParser(description="JBD BMS Protocol Scanner v2.1")
+    parser.add_argument("port",    nargs="?",  default=None)
+    parser.add_argument("--baud",  type=int,   default=None, help="Baud rate (implicit: testeaza 9600 si 19200)")
     parser.add_argument("--proto", choices=["dd","78","all"], default="all")
     parser.add_argument("--scan",  action="store_true")
     args = parser.parse_args()
 
-    p("="*65); p("  JBD BMS Protocol Scanner v2.0")
+    p("="*65); p("  JBD BMS Protocol Scanner v2.1")
     p(f"  Data: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    p(f"  Log:  {LOG_FILE}")
-    p("="*65)
+    p(f"  Log:  {LOG_FILE}"); p("="*65)
     p("  IMPORTANT: Ruleaza cand bateria se incarca/descarca activ!")
-    p("  La 100% SOC idle curentul = 0.00A este CORECT.")
+    p("  La 100% SOC idle, curentul 0.00A este CORECT.")
 
-    verify_checksum_examples()
+    verify_checksums()
 
     if args.scan:
         p(); p("  Porturi seriale disponibile:")
-        ports = scan_ports()
-        if not ports: p("  (niciun port gasit)")
+        if not scan_ports(): p("  (niciun port gasit)")
         return
 
     if not args.port:
-        p(); p("  EROARE: Specifica portul! (sau --scan)")
-        sys.exit(1)
+        p(); p("  EROARE: Specifica portul! (sau --scan)"); sys.exit(1)
 
     bauds   = [args.baud] if args.baud else [9600, 19200]
-    # Adrese de testat: standard (None), addr=0x00, addr=0x01
-    addrs   = [args.addr] if args.addr is not None else [None, 0x00, 0x01]
     all_res = {}
 
     for baud in bauds:
-        p(); p("="*65); p(f"  PORT: {args.port} @ {baud} bps"); p("="*65)
+        p(); p("="*65); p(f"  PORT: {args.port} @ {baud} bps 8N1"); p("="*65)
         try:
             ser = serial.Serial(port=args.port, baudrate=baud,
                 bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE, timeout=0.1)
-            p(f"  Serial OK")
-        except Exception as e: p(f"  EROARE: {e}"); continue
+                stopbits=serial.STOPBITS_ONE, timeout=0.05)
+            p(f"  Serial OK @ {baud} bps")
+        except Exception as e:
+            p(f"  EROARE: {e}"); continue
 
         time.sleep(0.3); res = {}
 
         if args.proto in ("dd", "all"):
-            for addr in addrs:
-                key = f"dd_addr_{addr if addr is not None else 'none'}"
-                res[key] = scan_dd_protocol(ser, baud, addr)
-                time.sleep(0.5)
+            found = scan_all_dd_variants(ser, baud)
+            res['dd'] = found
+
+        time.sleep(0.5)
 
         if args.proto in ("78", "all"):
-            res['proto_78'] = scan_protocol_78(ser, baud)
+            res['78'] = scan_protocol_78(ser, baud)
 
         all_res[baud] = res
         ser.close(); time.sleep(0.5)
 
-    # Sumar
+    # Sumar final
     p(); p("="*65); p("  SUMAR FINAL"); p("="*65)
-    best = None
     for baud, res in all_res.items():
-        for key, r in res.items():
-            if key.startswith('dd_'):
-                c03 = r.get('cmd03', {}); c04 = r.get('cmd04', {})
-                ok03 = not c03.get('error', True); ok04 = not c04.get('error', True)
-                addr_str = key.replace('dd_addr_', 'addr=')
-                p(f"  @ {baud} {key}: 0x03={'OK' if ok03 else 'FAIL'} 0x04={'OK' if ok04 else 'FAIL'}")
-                if ok03 and ok04 and best is None:
-                    best = (baud, addr_str, 'DD/A5/77')
-            elif key == 'proto_78':
-                p(f"  @ {baud} 0x78: {'OK' if r.get('ok') else 'FAIL'}")
-                if r.get('ok') and best is None:
-                    best = (baud, 'N/A', '0x78')
+        dd_ok = res.get('dd')
+        ok78  = res.get('78', {}).get('ok', False)
+        p(f"  @ {baud} bps:")
+        p(f"    DD/A5/77: {'OK - varianta: ' + str(dd_ok[1]) if dd_ok else 'TIMEOUT pe toate variantele'}")
+        p(f"    0x78:     {'OK' if ok78 else 'FAIL'}")
 
+    # Recomandare
     p()
-    if best:
-        baud, addr_str, proto = best
-        p(f"  RECOMANDAT: Protocol {proto} @ {baud} bps ({addr_str})")
-        if proto == 'DD/A5/77':
-            p(f"  Addon v7.x: schimba protocolul la DD/A5/77 cu baud_rate={baud}")
-        else:
-            p(f"  Addon v7.1 cu 0x78 protocol, baud_rate={baud}")
-    else:
-        p("  NICIUN PROTOCOL NU A RASPUNS!")
-        p("  Verifica: portul serial, cablul, baud rate, adresa")
+    dd_found = next((r['dd'] for r in all_res.values() if r.get('dd')), None)
+    ok78_found = next((b for b, r in all_res.items() if r.get('78', {}).get('ok')), None)
 
-    p(); p(f"  Log complet: {LOG_FILE}"); p("="*65)
+    if dd_found:
+        baud, variant, cmd = dd_found
+        p(f"  RECOMANDAT: DD/A5/77 @ {baud} bps varianta '{variant}'")
+        p(f"  Actualizeaza addon la v7.x cu baud_rate={baud}")
+    elif ok78_found:
+        p(f"  RECOMANDAT: Protocol 0x78 @ {ok78_found} bps")
+        p(f"  Foloseste addon v7.1 (0x78 protocol) cu baud_rate={ok78_found}")
+    else:
+        p("  NICIUN PROTOCOL NU A RASPUNS! Verifica portul, cablul, baud rate.")
+
+    p(); p(f"  Log: {LOG_FILE}"); p("="*65)
 
 if __name__ == "__main__": main()
