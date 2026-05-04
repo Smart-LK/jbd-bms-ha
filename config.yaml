@@ -1,6 +1,6 @@
 name: "JBD BMS MQTT"
-description: "Citire BMS JBD via protocol standard DD/A5/77 (JDB Communication Protocol V4). Publica in MQTT: tensiune, curent, putere, SoC, temperaturi NTC, tensiuni individuale celule, status protectii, versiune hardware. Control MOS charge/discharge."
-version: "7.0.0"
+description: "Citire BMS JBD via protocol 0x78 proprietar (confirmat functional pe hardware). Publica tensiune, curent, putere, SoC, temperaturi NTC, tensiuni individuale celule. Control MOS charge/discharge."
+version: "7.1.0"
 slug: "jbd_bms"
 init: false
 arch:
@@ -20,7 +20,7 @@ map:
 options:
   serial_port: "/dev/ttyUSB0"
   serial_port_by_id: ""
-  baud_rate: 9600
+  baud_rate: 19200
   poll_interval: 30
   num_cells: 9
   mqtt_host: "core-mosquitto"
