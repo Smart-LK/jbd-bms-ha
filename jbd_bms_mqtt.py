@@ -1,5 +1,5 @@
 """
-jbd_bms_mqtt.py  v6.2 - Protocol JBD 0x78 + Control MOS DD A5
+jbd_bms_mqtt.py  v6.3 - Protocol JBD 0x78 + Control MOS DD A5
 =============================================================
 - Citeste date BMS via protocol 0x78 broadcast
 - Publica senzori + binary_sensor MOS in HA via MQTT
@@ -9,6 +9,12 @@ jbd_bms_mqtt.py  v6.2 - Protocol JBD 0x78 + Control MOS DD A5
 - Suport serial_port_by_id: foloseste /dev/serial/by-id/ pentru port fix
 
 Changelog:
+  v6.3 - FIX: CURRENT_SCALE corectat de la 114.2 la 212.8
+         Calibrat din masuratori reale: BMS display=4.1A, HA=7.64A (2026-05-02)
+         Calcul: raw-offset = 7.64*114.2 = 872.5; SCALE = 872.5/4.1 = 212.8
+         Power = voltage * current se corecteaza automat (123W vs 230W anterior)
+         NOTA: CURRENT_OFFSET (37403) presupus corect (calibrat la 0A anterior)
+         Recomandat: verificare cu clampmetru la un curent cunoscut
   v6.2 - serial_port_by_id, scan porturi la startup
   v6.1 - fix KeyError options.json cu DEFAULTS + update()
   v6.0 - config din /data/options.json, log_level configurabil
@@ -31,9 +37,22 @@ import glob
 import threading
 import paho.mqtt.client as mqtt
 
-# --- CALIBRARE HARDWARE (constante fixe, specifice acestui BMS) ---------------
-CURRENT_OFFSET = 37403   # raw ADC la 0A
-CURRENT_SCALE  = 114.2   # LSB/A
+# --- CALIBRARE HARDWARE (constante specifice acestui BMS) ---------------------
+#
+# CURRENT_OFFSET: valoarea raw ADC cand curentul e 0A (calibrat anterior)
+# CURRENT_SCALE:  LSB/A - cat de multi "pasi" ADC corespund unui Amper
+#
+# Istoric calibrare:
+#   v6.2 si anterior: SCALE=114.2 -> dadea 7.64A cand BMS display arata 4.1A
+#   v6.3: SCALE=212.8 -> calculat din discrepanta observata 2026-05-02:
+#     raw_estimat = 7.64 * 114.2 + 37403 = 38275.5
+#     SCALE_corect = (38275.5 - 37403) / 4.1 = 872.5 / 4.1 = 212.8
+#
+# Verificare recomandata: masurare cu clampmetru la curent cunoscut
+# si ajustare CURRENT_SCALE = (raw - CURRENT_OFFSET) / I_real_A
+#
+CURRENT_OFFSET = 37403   # raw ADC la 0A (nemodificat)
+CURRENT_SCALE  = 212.8   # LSB/A (corectat v6.3: era 114.2)
 # ------------------------------------------------------------------------------
 
 # --- DEFAULTS -----------------------------------------------------------------
@@ -254,6 +273,9 @@ def parse_payload(data: bytes) -> dict:
     r = {}
     r['voltage'] = struct.unpack('>H', data[0:2])[0] / 100.0
 
+    # Curent: raw ADC 16-bit unsigned, calibrat cu CURRENT_OFFSET si CURRENT_SCALE
+    # Pozitiv = descarcare, negativ = incarcare (conventie JBD 0x78)
+    # v6.3: CURRENT_SCALE corectat la 212.8 (era 114.2, dadea ~2x prea mare)
     current_raw = struct.unpack('>H', data[6:8])[0]
     r['current']     = round((current_raw - CURRENT_OFFSET) / CURRENT_SCALE, 2)
     r['current_raw'] = current_raw
@@ -290,6 +312,7 @@ def parse_payload(data: bytes) -> dict:
             temps_cell.append(temp(struct.unpack('>H', data[off:off+2])[0]))
     r['temperatures'] = temps_cell
 
+    # Power calculat din tensiune si curent (automat corectat cu CURRENT_SCALE nou)
     r['power']         = round(r['voltage'] * r['current'], 1)
     r['charge_mos']    = mos_state['charge']
     r['discharge_mos'] = mos_state['discharge']
@@ -311,7 +334,9 @@ def read_bms(ser) -> dict:
     data = parse_payload(payload)
     if data:
         log.info(f"Pack: {data.get('voltage')}V | I={data.get('current')}A | "
-                 f"SoC={data.get('soc')}% | Delta={data.get('cell_delta_mv')}mV | "
+                 f"SoC={data.get('soc')}% | P={data.get('power')}W | "
+                 f"raw_I={data.get('current_raw')} | "
+                 f"Delta={data.get('cell_delta_mv')}mV | "
                  f"CHG={'ON' if data.get('charge_mos') else 'OFF'} DSG={'ON' if data.get('discharge_mos') else 'OFF'}")
     return data
 
@@ -352,6 +377,7 @@ def publish_discovery(client, num_cells, num_temps):
     pub_sensor("cell_min",   "BMS Celula Min",          "{{ value_json.cell_min_mv }}",        "mV",  None, icon="mdi:battery-arrow-down")
     pub_sensor("cell_max",   "BMS Celula Max",          "{{ value_json.cell_max_mv }}",        "mV",  None, icon="mdi:battery-arrow-up")
     pub_sensor("cell_delta", "BMS Delta Celule",        "{{ value_json.cell_delta_mv }}",      "mV",  None, icon="mdi:delta")
+    pub_sensor("current_raw","BMS Curent Raw ADC",      "{{ value_json.current_raw }}",        None,  None, "measurement", icon="mdi:chip")
 
     for i in range(min(num_temps, 3)):
         pub_sensor(f"temp_t{i+1}", f"BMS Temp T{i+1}",
@@ -412,10 +438,11 @@ def main():
     SERIAL_PORT = resolve_serial_port(cfg)
 
     log.info("=" * 60)
-    log.info(f"  JBD BMS MQTT Bridge v6.2")
+    log.info(f"  JBD BMS MQTT Bridge v6.3")
     log.info(f"  Serial: {SERIAL_PORT} @ {BAUD_RATE} bps 8N1")
     log.info(f"  MQTT:   {MQTT_HOST}:{MQTT_PORT} prefix={MQTT_PREFIX}")
     log.info(f"  Cells:  {NUM_CELLS}")
+    log.info(f"  Calibrare: OFFSET={CURRENT_OFFSET} SCALE={CURRENT_SCALE} LSB/A")
     log.info(f"  TX: {REQ_MAIN.hex(' ').upper()}")
     log.info("=" * 60)
 
